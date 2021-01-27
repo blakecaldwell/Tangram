@@ -49,18 +49,54 @@ def pp_adatas(adata_1, adata_2, genes=None):
     return adata_1, adata_2
 
 
+def adata_to_cluster_expression(adata, label, scale=True, add_density=True):
+    """
+    Convert an AnnData to a new AnnData with cluster expressions. Clusters are based on `label` in `adata.obs`.  The returned AnnData has an observation for each cluster, with the cluster-level expression equals to the average expression for that cluster.
+    All annotations in `adata.obs` except `label` are discarded in the returned AnnData.
+    If `add_density`, the normalized number of cells in each cluster is added to the returned AnnData as obs.cluster_density.
+    :param adata:
+    :param label: label for aggregating
+    """
+    try:
+        value_counts = adata.obs[label].value_counts(normalize=True)
+    except KeyError as e:
+        raise ValueError('Provided label must belong to adata.obs.')
+    unique_labels = value_counts.index
+    new_obs = pd.DataFrame({label: unique_labels})
+    adata_ret = sc.AnnData(obs=new_obs, var=adata.var)
+
+    X_new = np.empty((len(unique_labels), adata.shape[1]))
+    for index, l in enumerate(unique_labels):
+        if not scale:
+            X_new[index] = adata[adata.obs[label] == l].X.mean(axis=0)
+        else:
+            X_new[index] = adata[adata.obs[label] == l].X.sum(axis=0)
+    adata_ret.X = X_new
+
+    if add_density:
+        adata_ret.obs['cluster_density'] = adata_ret.obs[label].map(lambda i: value_counts[i])
+
+    return adata_ret
+
+
 def map_cells_to_space(adata_cells, adata_space, mode='simple', adata_map=None,
-                      device='cuda:0', learning_rate=0.1, num_epochs=1000):
+                      device='cuda:0', learning_rate=0.1, num_epochs=1000, d=None, aggregate_label=None):
     """
         Map single cell data (`adata_1`) on spatial data (`adata_2`). If `adata_map`
         is provided, resume from previous mapping.
         Returns a cell-by-spot AnnData containing the probability of mapping cell i on spot j.
         The `uns` field of the returned AnnData contains the training genes.
+        :param mode: Tangram mode. Currently supported: `simple`, `cell_cluster`
     """
     
     if adata_cells.var.index.equals(adata_space.var.index) is False:
         logging.error('Incompatible AnnDatas. Run `pp_adatas().')
         raise ValueError
+    if mode == 'cell_cluster' and aggregate_label is None:
+        raise ValueError('An aggregate_label must be specified if mode = cell_cluster.')
+
+    if mode == 'cell_cluster':
+        adata_cells = adata_to_cluster_expression(adata_cells, aggregate_label, scale=True, add_density=True)
     
     logging.info('Allocate tensors for mapping.')
     # Allocate tensors (AnnData matrix can be sparse or not)
@@ -80,8 +116,14 @@ def map_cells_to_space(adata_cells, adata_space, mode='simple', adata_map=None,
         X_type = type(adata_space.X)
         logging.error('AnnData X has unrecognized type: {}'.format(X_type))
         raise NotImplementedError
-    d = np.zeros(adata_space.n_obs)
-    
+
+    if mode == 'simple':
+        d = None
+
+    if mode == 'cell_cluster':
+        if d is None:
+            d = np.ones(G.shape[0])/G.shape[0]
+
     # Choose device
     device = torch.device(device)  # for gpu
 
@@ -92,6 +134,14 @@ def map_cells_to_space(adata_cells, adata_space, mode='simple', adata_map=None,
             'lambda_g1': 1,  # gene-voxel cos sim
             'lambda_g2': 0,  # voxel-gene cos sim
             'lambda_r': 0,  # regularizer: penalize entropy
+        }
+    elif mode == 'cell_cluster':
+        hyperparameters = {
+            'lambda_d': 1,  # KL (ie density) term
+            'lambda_g1': 1,  # gene-voxel cos sim
+            'lambda_g2': 0,  # voxel-gene cos sim
+            'lambda_r': 0,  # regularizer: penalize entropy
+            'd_source': np.array(adata_cells.obs['cluster_density']) # match sourge/target densities
         }
     else:
         raise NotImplementedError
